@@ -1,0 +1,212 @@
+---
+
+# Pre-FLight check for variable consistency
+- fail:
+    msg: the variable "{{ item }}" should be defined.
+  when: item == ''
+  with_items:
+    - "{{ act_appname }}"
+    - "{{ act_vendorkey }}"
+    - "{{ act_restoretime }}"
+    - "{{ src_host }}"
+    - "{{ tgt_host }}"
+
+# Generate a login token using the username, password and vendorkey
+- name: generating authentication token 
+  uri:
+    url: "{{ act_api_login }}"
+    validate_certs: no  
+  register: logintoken
+
+- name: session id is a fact
+  set_fact: 
+    act_sessionid: "{{ logintoken.json.sessionid }}"
+
+# try to ascertain the source host ID
+- name: search for host_id from name with src_hsot
+  block: 
+    - uri:
+        url: "{{ act_api_info }}/lshost?sessionid={{ act_sessionid }}&filtervalue={{ 'hostname=' | urlencode }}{{ src_host }}"
+        validate_certs: no
+      register: lssrchost
+
+    - set_fact:
+        src_host_rslt: "{{ lssrchost.json.result | length }}"
+    
+    - set_fact:
+        src_host_id: "{{ lssrchost.json.result.0.id }}"
+      when: src_host_rslt == "1"
+
+    - fail:
+        msg: "Unable to find a hostID with a src_host description or there are duplicated name hosts"
+      when: src_host_id is not defined
+
+  when: (src_host_isvm != "true" and act_imagename == "")
+
+# try to ascertain the source host ID
+- name: search for host_id from name with src_host
+  block: 
+    - uri:
+        url: "{{ act_api_info }}/lshost?sessionid={{ act_sessionid }}&filtervalue={{ 'hostname=' | urlencode }}{{ src_host }}{{ '&isvm=' | urlencode }}{{ src_host_isvm }}"
+        validate_certs: no
+      register: lssrchost
+
+    - set_fact:
+        src_host_rslt: "{{ lssrchost.json.result | length }}"
+    
+    - set_fact:
+        src_host_id: "{{ lssrchost.json.result.0.id }}"
+      when: src_host_rslt == "1"
+
+    - fail:
+        msg: "Unable to find a hostID with a src_host description or there are duplicated name hosts"
+      when: src_host_id is not defined
+
+  when: (src_host_isvm == "true" and act_imagename == "")
+
+# try to ascertain the target host ID
+- name: search for host_id from name tgt_host
+  block: 
+    - uri:
+        url: "{{ act_api_info }}/lshost?sessionid={{ act_sessionid }}&filtervalue={{ 'hostname=' | urlencode }}{{ tgt_host }}"
+        validate_certs: no
+      register: lstgthost
+
+    - set_fact:
+        tgt_host_rslt: "{{ lstgthost.json.result | length }}"
+    
+    - set_fact:
+        tgt_host_id: "{{ lstgthost.json.result.0.id }}"
+      when: tgt_host_rslt == "1"
+
+    - set_fact:
+        tgt_hasagent: "{{ lstgthost.json.result.0.hasagent }}"
+      when: tgt_host_rslt == "1"
+
+    - set_fact:
+        tgt_host_os: "{{ lstgthost.json.result.0.ostype | regex_replace('^(.+?) .+$','\\1') }}"
+      when: tgt_host_rslt == "1"
+
+    - fail:
+        msg: "Unable to find a hostID with a tgt_host description or there are duplicated name hosts"
+      when: tgt_host_id is not defined
+
+- block:
+  # Filter out the applicationid based on the application_name and hostid
+  - name: try to get the application id with hostid
+    block:
+    - uri:
+        url: "{{ act_api_info }}/lsapplication?sessionid={{ act_sessionid }}&filtervalue={{ 'appname=' | urlencode }}{{ act_appname | urlencode }}{{ '&hostid=' | urlencode }}{{ src_host_id }}"
+        validate_certs: no
+        method: GET
+      register: lsapplication 
+
+    - set_fact:
+        numlsapp: "{{ lsapplication.json.result | length }}"
+
+    - set_fact:
+        appid: "{{ lsapplication.json.result[0].id }}"
+      when: numlsapp != "0"
+
+    when: src_host_id is defined
+
+  # Pre-flight check for number of result with lsapplication
+  - fail:
+      msg: could not specify source VM with name because of incorrect name or duplication.
+    when: numlsapp != "1"
+
+  # Filter all the available backups if the jobclass is not specified
+  - block: 
+        - name: get the image list select the image from (for all the job_classes)
+          uri: 
+            url: "{{ act_api_info }}/lsbackup?filtervalue={{ 'appid=' | urlencode }}{{ appid }}&sessionid={{ act_sessionid }}"
+            validate_certs: no
+          register: lsbackup
+        - set_fact:
+            image_list: "{{ lsbackup }}"
+    when: act_job_class == ''
+
+    # Filter all the backup images if the jobclass is specified.
+  - block:
+        - name: get the image list select the image from (for {{ act_job_class }} job_class)
+          uri: 
+            url: "{{ act_api_info }}/lsbackup?filtervalue={{ 'appid=' | urlencode }}{{ appid }}{{ '&jobclass=' | urlencode }}{{ act_job_class | urlencode }}&sessionid={{ act_sessionid }}"
+            validate_certs: no
+          register: lsbackup
+        - set_fact:
+            image_list: "{{ lsbackup }}"
+    when: act_job_class != ''
+
+    # Selecting the image to mount based on the restoretime and strict_poliocy
+  - name: selecting an image to mount
+    uri:
+        url: "{{ act_api_info }}/lsbackup?argument={{ item.backupname }}&sessionid={{ act_sessionid }}"
+        validate_certs: no
+    register: image 
+    with_items: 
+        - "{{ image_list.json.result }}"
+
+  - name: save the image name to facts
+    set_fact: 
+        image_name: "{{ image | get_image_name (act_restoretime, strict_policy) }}" # Custom filter plugin
+    when: image is defined
+
+  when: act_imagename == ''
+
+- set_fact:
+    image_name: "{{ act_imagename }}"
+  when: act_imagename != ''
+
+- name: non-blocking mount operations
+  set_fact: 
+    block_mode: "&nowait"
+  when: act_nowait_mount == true
+
+- name: blocking mount operations
+  set_fact: 
+    block_mode: ""
+  when: act_nowait_mount != true
+
+# Build restoreoption with mount_point and issue mountimage command
+- block:
+  # for non-Windows 
+  - set_fact:
+      restoreoption: "mountpointperimage={{ mount_point }}"
+    when: tgt_host_os != "Win32"
+
+  # for Windows 
+  - block:
+    # Check if mount_point matches drive letter format like 'D:' 'D:\' or not.
+    - set_fact:
+        pathname: "{{ mount_point | regex_replace('^([a-zA-Z]:)[^0-9a-zA-Z]*?([0-9a-zA-Z]*)$','\\2') }}"
+      when: true
+      
+    - set_fact:
+        restoreoption: "mountdriveperimage={{ mount_point }}"
+      when: pathname == ""
+
+    - set_fact:
+        restoreoption: "mountpointperimage={{ mount_point }}"
+      when: pathname != ""
+
+    when: tgt_host_os == "Win32"
+
+  - name: Issue mountimage command with restoreoption
+    uri:
+      url: "{{ act_api_task}}/mountimage?image={{ image_name }}&host={{ tgt_host_id }}&label={{ act_imagelabel }}{{ block_mode }}&sessionid={{ act_sessionid }}&restoreoption={{ restoreoption | urlencode }}"
+      method: POST
+      validate_certs: no
+      timeout: 1200
+      async: 0
+        
+  when: (mount_point != "" and tgt_hasagent == true)
+
+# Issue mountimage command without restoreoption
+- name: issue mountimage command without restoreoption
+  uri:
+    url: "{{ act_api_task}}/mountimage?image={{ image_name }}&host={{ tgt_host_id }}&label={{ act_imagelabel }}{{ block_mode }}&sessionid={{ act_sessionid }}"
+    method: POST
+    validate_certs: no
+    timeout: 1200
+    async: 0
+  when: (mount_point == "" or tgt_hasagent == false)
